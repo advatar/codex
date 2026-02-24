@@ -1,0 +1,6 @@
+interface:
+  display_name: "Security Scan"
+  short_description: "Whole-repo vulnerability scan with adversarial verification"
+  default_prompt: "Run a security scan of this repository and return structured findings with severity/confidence plus patch proposals for review."
+policy:
+  allow_implicit_invocation: false

@@ -36,10 +36,12 @@ mod app_cmd;
 #[cfg(target_os = "macos")]
 mod desktop_app;
 mod mcp_cmd;
+mod security_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
 use crate::mcp_cmd::McpCli;
+use crate::security_cmd::SecurityCommand;
 
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -95,6 +97,9 @@ enum Subcommand {
 
     /// Manage external MCP servers for Codex.
     Mcp(McpCli),
+
+    /// Security scanning commands.
+    Security(SecurityCommand),
 
     /// Start Codex as an MCP server (stdio).
     McpServer,
@@ -594,6 +599,16 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             prepend_config_flags(&mut mcp_cli.config_overrides, root_config_overrides.clone());
             mcp_cli.run().await?;
         }
+        Some(Subcommand::Security(security_command)) => match security_command.subcommand {
+            security_cmd::SecuritySubcommand::Scan(scan_args) => {
+                security_cmd::run_security_scan(
+                    scan_args,
+                    root_config_overrides.clone(),
+                    &interactive,
+                )
+                .await?;
+            }
+        },
         Some(Subcommand::AppServer(app_server_cli)) => match app_server_cli.subcommand {
             None => {
                 let transport = app_server_cli.listen;
@@ -1408,6 +1423,85 @@ mod tests {
         let parse_result =
             MultitoolCli::try_parse_from(["codex", "app-server", "--listen", "http://foo"]);
         assert!(parse_result.is_err());
+    }
+
+    #[test]
+    fn security_scan_parses_flags() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "security",
+            "scan",
+            "--format",
+            "json",
+            "--out",
+            "report.json",
+            "--severity-floor",
+            "high",
+            "--confidence-floor",
+            "0.75",
+            "--scope",
+            "src",
+            "--exclude",
+            "target/**",
+            "--max-files",
+            "123",
+            "--max-file-bytes",
+            "4567",
+            "--no-patches",
+            "--parallel",
+            "4",
+        ])
+        .expect("parse should succeed");
+
+        let Some(Subcommand::Security(security_cmd::SecurityCommand { subcommand })) =
+            cli.subcommand
+        else {
+            panic!("expected security subcommand");
+        };
+        let scan_args = match subcommand {
+            security_cmd::SecuritySubcommand::Scan(scan_args) => scan_args,
+        };
+
+        assert_eq!(scan_args.format, security_cmd::SecurityOutputFormat::Json);
+        assert_eq!(scan_args.out, Some(std::path::PathBuf::from("report.json")));
+        assert_eq!(
+            scan_args.severity_floor,
+            security_cmd::SecuritySeverity::High
+        );
+        assert_eq!(scan_args.confidence_floor, 0.75);
+        assert_eq!(scan_args.scope, vec![std::path::PathBuf::from("src")]);
+        assert_eq!(scan_args.exclude, vec!["target/**".to_string()]);
+        assert_eq!(scan_args.max_files, 123);
+        assert_eq!(scan_args.max_file_bytes, 4567);
+        assert!(scan_args.no_patches);
+        assert_eq!(scan_args.parallel, Some(4));
+    }
+
+    #[test]
+    fn security_scan_parses_sarif_shortcut() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "security",
+            "scan",
+            "--sarif",
+            "out/results.sarif",
+        ])
+        .expect("parse should succeed");
+
+        let Some(Subcommand::Security(security_cmd::SecurityCommand { subcommand })) =
+            cli.subcommand
+        else {
+            panic!("expected security subcommand");
+        };
+        let scan_args = match subcommand {
+            security_cmd::SecuritySubcommand::Scan(scan_args) => scan_args,
+        };
+
+        assert_eq!(
+            scan_args.sarif,
+            Some(std::path::PathBuf::from("out/results.sarif"))
+        );
+        assert_eq!(scan_args.format, security_cmd::SecurityOutputFormat::Md);
     }
 
     #[test]

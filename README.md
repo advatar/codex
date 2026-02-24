@@ -28,6 +28,21 @@ brew install --cask codex
 
 Then simply run `codex` to get started.
 
+### Security scanning
+
+Run a whole-repo security scan with safe defaults:
+
+```shell
+codex security scan
+```
+
+Export JSON or SARIF for automation:
+
+```shell
+codex security scan --format json --out security-findings.json
+codex security scan --sarif security-findings.sarif
+```
+
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
 
@@ -55,6 +70,7 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Codex Documentation**](https://developers.openai.com/codex)
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
+- [**Security scan command**](./docs/security-scan.md)
 - [**Open source fund**](./docs/open-source-fund.md)
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).

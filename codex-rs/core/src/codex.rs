@@ -70,8 +70,8 @@ use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::CallToolResult;
-use codex_protocol::models::AdditionalPermissions;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::FileChange;
@@ -640,6 +640,7 @@ impl TurnContext {
             model_info: &model_info,
             features: &features,
             web_search_mode: self.tools_config.web_search_mode,
+            session_source: self.session_source.clone(),
         })
         .with_allow_login_shell(self.tools_config.allow_login_shell)
         .with_agent_roles(config.agent_roles.clone());
@@ -975,6 +976,7 @@ impl Session {
             model_info: &model_info,
             features: &per_turn_config.features,
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
+            session_source: session_source.clone(),
         })
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
         .with_agent_roles(per_turn_config.agent_roles.clone());
@@ -1329,6 +1331,7 @@ impl Session {
                 config.background_terminal_max_timeout,
             ),
             shell_zsh_path: config.zsh_path.clone(),
+            main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
             analytics_events_client: AnalyticsEventsClient::new(
                 Arc::clone(&config),
                 Arc::clone(&auth_manager),
@@ -2568,7 +2571,7 @@ impl Session {
         reason: Option<String>,
         network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
-        additional_permissions: Option<AdditionalPermissions>,
+        additional_permissions: Option<PermissionProfile>,
     ) -> ReviewDecision {
         //  command-level approvals use `call_id`.
         // `approval_id` is only present for subcommand callbacks (execve intercept)
@@ -4592,6 +4595,7 @@ async fn spawn_review_thread(
         model_info: &review_model_info,
         features: &review_features,
         web_search_mode: Some(review_web_search_mode),
+        session_source: parent_turn_context.session_source.clone(),
     })
     .with_allow_login_shell(config.permissions.allow_login_shell)
     .with_agent_roles(config.agent_roles.clone());
@@ -4731,9 +4735,9 @@ fn skills_to_info(
                         .collect(),
                 }
             }),
-            path: skill.path.clone(),
+            path: skill.path_to_skills_md.clone(),
             scope: skill.scope,
-            enabled: !disabled_paths.contains(&skill.path),
+            enabled: !disabled_paths.contains(&skill.path_to_skills_md),
         })
         .collect()
 }
@@ -6356,6 +6360,8 @@ pub(super) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
 use crate::memories::prompts::build_memory_tool_developer_instructions;
 #[cfg(test)]
 pub(crate) use tests::make_session_and_context;
+#[cfg(test)]
+pub(crate) use tests::make_session_and_context_with_dynamic_tools_and_rx;
 #[cfg(test)]
 pub(crate) use tests::make_session_and_context_with_rx;
 #[cfg(test)]
@@ -8198,6 +8204,7 @@ mod tests {
                 config.background_terminal_max_timeout,
             ),
             shell_zsh_path: None,
+            main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
             analytics_events_client: AnalyticsEventsClient::new(
                 Arc::clone(&config),
                 Arc::clone(&auth_manager),
@@ -8268,9 +8275,9 @@ mod tests {
         (session, turn_context)
     }
 
-    // Like make_session_and_context, but returns Arc<Session> and the event receiver
-    // so tests can assert on emitted events.
-    pub(crate) async fn make_session_and_context_with_rx() -> (
+    pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
+        dynamic_tools: Vec<DynamicToolSpec>,
+    ) -> (
         Arc<Session>,
         Arc<TurnContext>,
         async_channel::Receiver<Event>,
@@ -8322,7 +8329,7 @@ mod tests {
             thread_name: None,
             original_config_do_not_use: Arc::clone(&config),
             session_source: SessionSource::Exec,
-            dynamic_tools: Vec::new(),
+            dynamic_tools,
             persist_extended_history: false,
         };
         let per_turn_config = Session::build_per_turn_config(&session_configuration);
@@ -8353,6 +8360,7 @@ mod tests {
                 config.background_terminal_max_timeout,
             ),
             shell_zsh_path: None,
+            main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
             analytics_events_client: AnalyticsEventsClient::new(
                 Arc::clone(&config),
                 Arc::clone(&auth_manager),
@@ -8421,6 +8429,16 @@ mod tests {
         });
 
         (session, turn_context, rx_event)
+    }
+
+    // Like make_session_and_context, but returns Arc<Session> and the event receiver
+    // so tests can assert on emitted events.
+    pub(crate) async fn make_session_and_context_with_rx() -> (
+        Arc<Session>,
+        Arc<TurnContext>,
+        async_channel::Receiver<Event>,
+    ) {
+        make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
     }
 
     #[tokio::test]

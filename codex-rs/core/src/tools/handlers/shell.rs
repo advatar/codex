@@ -33,7 +33,7 @@ use crate::tools::runtimes::shell::ShellRuntime;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::spec::ShellCommandBackendConfig;
-use codex_protocol::models::AdditionalPermissions;
+use codex_protocol::models::PermissionProfile;
 
 pub struct ShellHandler;
 
@@ -50,7 +50,7 @@ pub struct ShellCommandHandler {
 struct RunExecLikeArgs {
     tool_name: String,
     exec_params: ExecParams,
-    additional_permissions: Option<AdditionalPermissions>,
+    additional_permissions: Option<PermissionProfile>,
     prefix_rule: Option<Vec<String>>,
     session: Arc<crate::codex::Session>,
     turn: Arc<TurnContext>,
@@ -176,6 +176,7 @@ impl ToolHandler for ShellHandler {
             call_id,
             tool_name,
             payload,
+            ..
         } = invocation;
 
         match payload {
@@ -261,6 +262,7 @@ impl ToolHandler for ShellCommandHandler {
             call_id,
             tool_name,
             payload,
+            ..
         } = invocation;
 
         let ToolPayload::Function { arguments } = payload else {

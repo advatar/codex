@@ -44,6 +44,20 @@ pub(super) struct PendingInteractiveReplayState {
 }
 
 impl PendingInteractiveReplayState {
+    pub(super) fn event_can_change_pending_thread_approvals(event: &Event) -> bool {
+        matches!(
+            &event.msg,
+            EventMsg::ExecApprovalRequest(_)
+                | EventMsg::ApplyPatchApprovalRequest(_)
+                | EventMsg::ElicitationRequest(_)
+                | EventMsg::ExecCommandBegin(_)
+                | EventMsg::PatchApplyBegin(_)
+                | EventMsg::TurnComplete(_)
+                | EventMsg::TurnAborted(_)
+                | EventMsg::ShutdownComplete
+        )
+    }
+
     pub(super) fn op_can_change_state(op: &Op) -> bool {
         matches!(
             op,
@@ -240,6 +254,12 @@ impl PendingInteractiveReplayState {
         }
     }
 
+    pub(super) fn has_pending_thread_approvals(&self) -> bool {
+        !self.exec_approval_call_ids.is_empty()
+            || !self.patch_approval_call_ids.is_empty()
+            || !self.elicitation_requests.is_empty()
+    }
+
     fn clear_request_user_input_turn(&mut self, turn_id: &str) {
         if let Some(call_ids) = self.request_user_input_call_ids_by_turn_id.remove(turn_id) {
             for call_id in call_ids {
@@ -382,6 +402,7 @@ mod tests {
                     proposed_execpolicy_amendment: None,
                     proposed_network_policy_amendments: None,
                     additional_permissions: None,
+                    available_decisions: None,
                     parsed_cmd: Vec::new(),
                 },
             ),
@@ -524,6 +545,7 @@ mod tests {
                     proposed_execpolicy_amendment: None,
                     proposed_network_policy_amendments: None,
                     additional_permissions: None,
+                    available_decisions: None,
                     parsed_cmd: Vec::new(),
                 },
             ),
@@ -564,9 +586,17 @@ mod tests {
         store.push_event(Event {
             id: "ev-1".to_string(),
             msg: EventMsg::ElicitationRequest(codex_protocol::approvals::ElicitationRequestEvent {
+                turn_id: Some("turn-1".to_string()),
                 server_name: "server-1".to_string(),
                 id: request_id.clone(),
-                message: "Please confirm".to_string(),
+                request: codex_protocol::approvals::ElicitationRequest::Form {
+                    meta: None,
+                    message: "Please confirm".to_string(),
+                    requested_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                },
             }),
         });
 
@@ -574,6 +604,8 @@ mod tests {
             server_name: "server-1".to_string(),
             request_id,
             decision: codex_protocol::approvals::ElicitationAction::Accept,
+            content: None,
+            meta: None,
         });
 
         let snapshot = store.snapshot();
@@ -581,5 +613,58 @@ mod tests {
             snapshot.events.is_empty(),
             "resolved elicitation prompt should not replay on thread switch"
         );
+    }
+
+    #[test]
+    fn thread_event_store_reports_pending_thread_approvals() {
+        let mut store = ThreadEventStore::new(8);
+        assert_eq!(store.has_pending_thread_approvals(), false);
+
+        store.push_event(Event {
+            id: "ev-1".to_string(),
+            msg: EventMsg::ExecApprovalRequest(
+                codex_protocol::protocol::ExecApprovalRequestEvent {
+                    call_id: "call-1".to_string(),
+                    approval_id: None,
+                    turn_id: "turn-1".to_string(),
+                    command: vec!["echo".to_string(), "hi".to_string()],
+                    cwd: PathBuf::from("/tmp"),
+                    reason: None,
+                    network_approval_context: None,
+                    proposed_execpolicy_amendment: None,
+                    proposed_network_policy_amendments: None,
+                    additional_permissions: None,
+                    available_decisions: None,
+                    parsed_cmd: Vec::new(),
+                },
+            ),
+        });
+
+        assert_eq!(store.has_pending_thread_approvals(), true);
+
+        store.note_outbound_op(&Op::ExecApproval {
+            id: "call-1".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            decision: codex_protocol::protocol::ReviewDecision::Approved,
+        });
+
+        assert_eq!(store.has_pending_thread_approvals(), false);
+    }
+
+    #[test]
+    fn request_user_input_does_not_count_as_pending_thread_approval() {
+        let mut store = ThreadEventStore::new(8);
+        store.push_event(Event {
+            id: "ev-1".to_string(),
+            msg: EventMsg::RequestUserInput(
+                codex_protocol::request_user_input::RequestUserInputEvent {
+                    call_id: "call-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    questions: Vec::new(),
+                },
+            ),
+        });
+
+        assert_eq!(store.has_pending_thread_approvals(), false);
     }
 }

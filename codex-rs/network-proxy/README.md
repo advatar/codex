@@ -4,7 +4,6 @@
 
 - an HTTP proxy (default `127.0.0.1:3128`)
 - a SOCKS5 proxy (default `127.0.0.1:8081`, enabled by default)
-- an admin HTTP API (default `127.0.0.1:8080`)
 
 It enforces an allow/deny policy and a "limited" mode intended for read-only network access.
 
@@ -20,7 +19,6 @@ Example config:
 [network]
 enabled = true
 proxy_url = "http://127.0.0.1:3128"
-admin_url = "http://127.0.0.1:8080"
 # SOCKS5 listener (enabled by default).
 enable_socks5 = true
 socks_url = "http://127.0.0.1:8081"
@@ -32,7 +30,6 @@ allow_upstream_proxy = true
 # By default, non-loopback binds are clamped to loopback for safety.
 # If you want to expose these listeners beyond localhost, you must opt in explicitly.
 dangerously_allow_non_loopback_proxy = false
-dangerously_allow_non_loopback_admin = false
 mode = "full" # default when unset; use "limited" for read-only mode
 # When true, HTTPS CONNECT can be terminated so limited-mode method policy still applies.
 mitm = false
@@ -104,7 +101,6 @@ use codex_network_proxy::{NetworkProxy, NetworkDecision, NetworkPolicyRequest};
 
 let proxy = NetworkProxy::builder()
     .http_addr("127.0.0.1:8080".parse()?)
-    .admin_addr("127.0.0.1:9000".parse()?)
     .policy_decider(|request: NetworkPolicyRequest| async move {
         // Example: auto-allow when exec policy already approved a command prefix.
         if let Some(command) = request.command.as_deref() {
@@ -124,7 +120,7 @@ handle.shutdown().await?;
 ```
 
 When unix socket proxying is enabled (`allow_unix_sockets` or
-`dangerously_allow_all_unix_sockets`), HTTP/admin bind overrides are still clamped to loopback to
+`dangerously_allow_all_unix_sockets`), proxy bind overrides are still clamped to loopback to
 avoid turning the proxy into a remote bridge to local daemons.
 
 ### Policy hook (exec-policy mapping)
@@ -137,24 +133,44 @@ the decider can auto-allow network requests originating from that command.
 **Important:** Explicit deny rules still win. The decider only gets a chance to override
 `not_allowed` (allowlist misses), not `denied` or `not_allowed_local`.
 
-## Admin API
+## OTEL Audit Events (embedded/managed)
 
-The admin API is a small HTTP server intended for debugging and runtime adjustments.
+When `codex-network-proxy` is embedded in managed Codex runtime, policy decisions emit structured
+OTEL-compatible events with `target=codex_otel.network_proxy`.
 
-Endpoints:
+Event name:
 
-```bash
-curl -sS http://127.0.0.1:8080/health
-curl -sS http://127.0.0.1:8080/config
-curl -sS http://127.0.0.1:8080/patterns
-curl -sS http://127.0.0.1:8080/blocked
+- `codex.network_proxy.policy_decision`
+  - emitted for each policy decision (`domain` and `non_domain`).
+  - `network.policy.scope = "domain"` for host-policy evaluations (`evaluate_host_policy`).
+  - `network.policy.scope = "non_domain"` for mode-guard/proxy-state checks (including unix-socket guard paths and unix-socket allow decisions).
 
-# Switch modes without restarting:
-curl -sS -X POST http://127.0.0.1:8080/mode -d '{"mode":"full"}'
+Common fields:
 
-# Force a config reload:
-curl -sS -X POST http://127.0.0.1:8080/reload
-```
+- `event.name`
+- `event.timestamp` (RFC3339 UTC, millisecond precision)
+- optional metadata:
+  - `conversation.id`
+  - `app.version`
+  - `user.account_id`
+- policy/network:
+  - `network.policy.scope` (`domain` or `non_domain`)
+  - `network.policy.decision` (`allow`, `deny`, or `ask`)
+  - `network.policy.source` (`baseline_policy`, `mode_guard`, `proxy_state`, `decider`)
+  - `network.policy.reason`
+  - `network.transport.protocol`
+  - `server.address`
+  - `server.port`
+  - `http.request.method` (defaults to `"none"` when absent)
+  - `client.address` (defaults to `"unknown"` when absent)
+  - `network.policy.override` (`true` only when decider-allow overrides baseline `not_allowed`)
+
+Unix-socket block-path audits use sentinel endpoint values:
+
+- `server.address = "unix-socket"`
+- `server.port = 0`
+
+Audit events intentionally avoid logging full URL/path/query data.
 
 ## Platform notes
 
@@ -178,11 +194,9 @@ what it can reasonably guarantee.
   - only `GET`, `HEAD`, and `OPTIONS` are allowed
   - HTTPS `CONNECT` remains a tunnel; limited-mode method enforcement does not apply to HTTPS
 - Listener safety defaults:
-  - the admin API is unauthenticated; non-loopback binds are clamped unless explicitly enabled via
-    `dangerously_allow_non_loopback_admin`
-- the HTTP proxy listener similarly clamps non-loopback binds unless explicitly enabled via
+  - the HTTP proxy listener clamps non-loopback binds unless explicitly enabled via
     `dangerously_allow_non_loopback_proxy`
-- when unix socket proxying is enabled, both listeners are forced to loopback to avoid turning the
+- when unix socket proxying is enabled, all proxy listeners are forced to loopback to avoid turning the
     proxy into a remote bridge into local daemons.
 - `dangerously_allow_all_unix_sockets = true` bypasses the unix socket allowlist entirely (still
   macOS-only and absolute-path-only). Use only in tightly controlled environments.

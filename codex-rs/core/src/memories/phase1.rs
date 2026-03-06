@@ -7,12 +7,14 @@ use crate::config::types::MemoriesConfig;
 use crate::error::CodexErr;
 use crate::memories::metrics;
 use crate::memories::phase_one;
+use crate::memories::phase_one::PRUNE_BATCH_SIZE;
 use crate::memories::prompts::build_stage_one_input_message;
 use crate::rollout::INTERACTIVE_SESSION_SOURCES;
 use crate::rollout::policy::should_persist_response_item_for_memories;
 use codex_api::ResponseEvent;
 use codex_otel::OtelManager;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -36,6 +38,7 @@ pub(in crate::memories) struct RequestContext {
     pub(in crate::memories) otel_manager: OtelManager,
     pub(in crate::memories) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(in crate::memories) reasoning_summary: ReasoningSummaryConfig,
+    pub(in crate::memories) service_tier: Option<ServiceTier>,
     pub(in crate::memories) turn_metadata_header: Option<String>,
 }
 
@@ -118,6 +121,30 @@ pub(in crate::memories) async fn run(session: &Arc<Session>, config: &Config) {
     );
 }
 
+/// Prune old un-used "dead" raw memories.
+pub(in crate::memories) async fn prune(session: &Arc<Session>, config: &Config) {
+    if let Some(db) = session.services.state_db.as_deref() {
+        let max_unused_days = config.memories.max_unused_days;
+        match db
+            .prune_stage1_outputs_for_retention(max_unused_days, PRUNE_BATCH_SIZE)
+            .await
+        {
+            Ok(pruned) => {
+                if pruned > 0 {
+                    info!(
+                        "memory startup pruned {pruned} stale stage-1 output row(s) older than {max_unused_days} days"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "state db prune_stage1_outputs_for_retention failed during memories startup: {err}"
+                );
+            }
+        }
+    }
+}
+
 /// JSON schema used to constrain phase-1 model output.
 pub fn output_schema() -> Value {
     json!({
@@ -144,6 +171,7 @@ impl RequestContext {
             otel_manager: turn_context.otel_manager.clone(),
             reasoning_effort: Some(phase_one::REASONING_EFFORT),
             reasoning_summary: turn_context.reasoning_summary,
+            service_tier: turn_context.config.service_tier,
         }
     }
 }
@@ -193,7 +221,7 @@ async fn claim_startup_jobs(
 async fn build_request_context(session: &Arc<Session>, config: &Config) -> RequestContext {
     let model_name = config
         .memories
-        .phase_1_model
+        .extract_model
         .clone()
         .unwrap_or(phase_one::MODEL.to_string());
     let model = session
@@ -322,6 +350,7 @@ mod job {
                 &stage_one_context.otel_manager,
                 stage_one_context.reasoning_effort,
                 stage_one_context.reasoning_summary,
+                stage_one_context.service_tier,
                 stage_one_context.turn_metadata_header.as_deref(),
             )
             .await?;

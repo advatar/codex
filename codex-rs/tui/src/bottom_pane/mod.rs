@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
-use crate::bottom_pane::queued_user_messages::QueuedUserMessages;
+use crate::bottom_pane::pending_input_preview::PendingInputPreview;
+use crate::bottom_pane::pending_thread_approvals::PendingThreadApprovals;
 use crate::bottom_pane::unified_exec_footer::UnifiedExecFooter;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
@@ -41,6 +42,7 @@ use std::time::Duration;
 
 mod app_link_view;
 mod approval_overlay;
+mod mcp_server_elicitation;
 mod multi_select_picker;
 mod request_user_input;
 mod status_line_setup;
@@ -48,6 +50,8 @@ pub(crate) use app_link_view::AppLinkView;
 pub(crate) use app_link_view::AppLinkViewParams;
 pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
+pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
+pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
 pub(crate) use request_user_input::RequestUserInputOverlay;
 mod bottom_pane_view;
 
@@ -90,10 +94,12 @@ pub(crate) use feedback_view::feedback_upload_consent_params;
 pub(crate) use skills_toggle_view::SkillsToggleItem;
 pub(crate) use skills_toggle_view::SkillsToggleView;
 pub(crate) use status_line_setup::StatusLineItem;
+pub(crate) use status_line_setup::StatusLinePreviewData;
 pub(crate) use status_line_setup::StatusLineSetupView;
 mod paste_burst;
+mod pending_input_preview;
+mod pending_thread_approvals;
 pub mod popup_consts;
-mod queued_user_messages;
 mod scroll_state;
 mod selection_popup_common;
 mod textarea;
@@ -127,6 +133,7 @@ pub(crate) enum CancellationEvent {
     NotHandled,
 }
 
+use crate::bottom_pane::prompt_args::parse_slash_name;
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::InputResult;
@@ -169,8 +176,10 @@ pub(crate) struct BottomPane {
     /// When a status row exists, this summary is mirrored inline in that row;
     /// when no status row exists, it renders as its own footer row.
     unified_exec_footer: UnifiedExecFooter,
-    /// Queued user messages to show above the composer while a turn is running.
-    queued_user_messages: QueuedUserMessages,
+    /// Preview of pending steers and queued drafts shown above the composer.
+    pending_input_preview: PendingInputPreview,
+    /// Inactive threads with pending approval requests.
+    pending_thread_approvals: PendingThreadApprovals,
     context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
 }
@@ -218,7 +227,8 @@ impl BottomPane {
             is_task_running: false,
             status: None,
             unified_exec_footer: UnifiedExecFooter::new(),
-            queued_user_messages: QueuedUserMessages::new(),
+            pending_input_preview: PendingInputPreview::new(),
+            pending_thread_approvals: PendingThreadApprovals::new(),
             esc_backtrack_hint: false,
             animations_enabled,
             context_window_percent: None,
@@ -260,10 +270,6 @@ impl BottomPane {
         let _ = self.take_mention_bindings();
     }
 
-    pub fn set_steer_enabled(&mut self, enabled: bool) {
-        self.composer.set_steer_enabled(enabled);
-    }
-
     pub fn set_collaboration_modes_enabled(&mut self, enabled: bool) {
         self.composer.set_collaboration_modes_enabled(enabled);
         self.request_redraw();
@@ -292,8 +298,18 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub fn set_fast_command_enabled(&mut self, enabled: bool) {
+        self.composer.set_fast_command_enabled(enabled);
+        self.request_redraw();
+    }
+
     pub fn set_realtime_conversation_enabled(&mut self, enabled: bool) {
         self.composer.set_realtime_conversation_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub fn set_audio_device_selection_enabled(&mut self, enabled: bool) {
+        self.composer.set_audio_device_selection_enabled(enabled);
         self.request_redraw();
     }
 
@@ -305,7 +321,7 @@ impl BottomPane {
     /// Update the key hint shown next to queued messages so it matches the
     /// binding that `ChatWidget` actually listens for.
     pub(crate) fn set_queued_message_edit_binding(&mut self, binding: KeyBinding) {
-        self.queued_user_messages.set_edit_binding(binding);
+        self.pending_input_preview.set_edit_binding(binding);
         self.request_redraw();
     }
 
@@ -392,11 +408,20 @@ impl BottomPane {
             self.request_redraw();
             InputResult::None
         } else {
+            let is_agent_command = self
+                .composer_text()
+                .lines()
+                .next()
+                .and_then(parse_slash_name)
+                .is_some_and(|(name, _, _)| name == "agent");
+
             // If a task is running and a status line is visible, allow Esc to
             // send an interrupt even while the composer has focus.
             // When a popup is active, prefer dismissing it over interrupting the task.
             if key_event.code == KeyCode::Esc
+                && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                 && self.is_task_running
+                && !is_agent_command
                 && !self.composer.popup_active()
                 && let Some(status) = &self.status
             {
@@ -558,6 +583,10 @@ impl BottomPane {
         self.composer.current_text_with_pending()
     }
 
+    pub(crate) fn composer_pending_pastes(&self) -> Vec<(String, String)> {
+        self.composer.pending_pastes()
+    }
+
     pub(crate) fn apply_external_edit(&mut self, text: String) {
         self.composer.apply_external_edit(text);
         self.request_redraw();
@@ -581,6 +610,11 @@ impl BottomPane {
         let urls = self.composer.take_remote_image_urls();
         self.request_redraw();
         urls
+    }
+
+    pub(crate) fn set_composer_pending_pastes(&mut self, pending_pastes: Vec<(String, String)>) {
+        self.composer.set_pending_pastes(pending_pastes);
+        self.request_redraw();
     }
 
     /// Update the status indicator header (defaults to "Working") and details below it.
@@ -753,10 +787,27 @@ impl BottomPane {
         true
     }
 
-    /// Update the queued messages preview shown above the composer.
-    pub(crate) fn set_queued_user_messages(&mut self, queued: Vec<String>) {
-        self.queued_user_messages.messages = queued;
+    /// Update the pending-input preview shown above the composer.
+    pub(crate) fn set_pending_input_preview(
+        &mut self,
+        queued: Vec<String>,
+        pending_steers: Vec<String>,
+    ) {
+        self.pending_input_preview.pending_steers = pending_steers;
+        self.pending_input_preview.queued_messages = queued;
         self.request_redraw();
+    }
+
+    /// Update the inactive-thread approval list shown above the composer.
+    pub(crate) fn set_pending_thread_approvals(&mut self, threads: Vec<String>) {
+        if self.pending_thread_approvals.set_threads(threads) {
+            self.request_redraw();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_thread_approvals(&self) -> &[String] {
+        self.pending_thread_approvals.threads()
     }
 
     /// Update the unified-exec process set and refresh whichever summary surface is active.
@@ -792,6 +843,11 @@ impl BottomPane {
 
     pub(crate) fn is_task_running(&self) -> bool {
         self.is_task_running
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_view(&self) -> bool {
+        !self.view_stack.is_empty()
     }
 
     /// Return true when the pane is in the regular composer state without any
@@ -864,6 +920,37 @@ impl BottomPane {
         self.set_composer_input_enabled(
             false,
             Some("Answer the questions to continue.".to_string()),
+        );
+        self.push_view(Box::new(modal));
+    }
+
+    pub(crate) fn push_mcp_server_elicitation_request(
+        &mut self,
+        request: McpServerElicitationFormRequest,
+    ) {
+        let request = if let Some(view) = self.view_stack.last_mut() {
+            match view.try_consume_mcp_server_elicitation_request(request) {
+                Some(request) => request,
+                None => {
+                    self.request_redraw();
+                    return;
+                }
+            }
+        } else {
+            request
+        };
+
+        let modal = McpServerElicitationOverlay::new(
+            request,
+            self.app_event_tx.clone(),
+            self.has_input_focus,
+            self.enhanced_keys_supported,
+            self.disable_paste_burst,
+        );
+        self.pause_status_timer_for_modal();
+        self.set_composer_input_enabled(
+            false,
+            Some("Respond to the MCP server request to continue.".to_string()),
         );
         self.push_view(Box::new(modal));
     }
@@ -980,14 +1067,21 @@ impl BottomPane {
             if self.status.is_none() && !self.unified_exec_footer.is_empty() {
                 flex.push(0, RenderableItem::Borrowed(&self.unified_exec_footer));
             }
-            let has_queued_messages = !self.queued_user_messages.messages.is_empty();
+            let has_pending_thread_approvals = !self.pending_thread_approvals.is_empty();
+            let has_pending_input = !self.pending_input_preview.queued_messages.is_empty()
+                || !self.pending_input_preview.pending_steers.is_empty();
             let has_status_or_footer =
                 self.status.is_some() || !self.unified_exec_footer.is_empty();
-            if has_queued_messages && has_status_or_footer {
+            let has_inline_previews = has_pending_thread_approvals || has_pending_input;
+            if has_inline_previews && has_status_or_footer {
                 flex.push(0, RenderableItem::Owned("".into()));
             }
-            flex.push(1, RenderableItem::Borrowed(&self.queued_user_messages));
-            if !has_queued_messages && has_status_or_footer {
+            flex.push(1, RenderableItem::Borrowed(&self.pending_thread_approvals));
+            if has_pending_thread_approvals && has_pending_input {
+                flex.push(0, RenderableItem::Owned("".into()));
+            }
+            flex.push(1, RenderableItem::Borrowed(&self.pending_input_preview));
+            if !has_inline_previews && has_status_or_footer {
                 flex.push(0, RenderableItem::Owned("".into()));
             }
             let mut flex2 = FlexRenderable::new();
@@ -1091,12 +1185,16 @@ mod tests {
 
     fn exec_request() -> ApprovalRequest {
         ApprovalRequest::Exec {
+            thread_id: codex_protocol::ThreadId::new(),
+            thread_label: None,
             id: "1".to_string(),
             command: vec!["echo".into(), "ok".into()],
             reason: None,
+            available_decisions: vec![
+                codex_protocol::protocol::ReviewDecision::Approved,
+                codex_protocol::protocol::ReviewDecision::Abort,
+            ],
             network_approval_context: None,
-            proposed_execpolicy_amendment: None,
-            proposed_network_policy_amendments: None,
             additional_permissions: None,
         }
     }
@@ -1358,7 +1456,7 @@ mod tests {
             StatusDetailsCapitalization::CapitalizeFirst,
             STATUS_DETAILS_DEFAULT_MAX_LINES,
         );
-        pane.set_queued_user_messages(vec!["Queued follow-up question".to_string()]);
+        pane.set_pending_input_preview(vec!["Queued follow-up question".to_string()], Vec::new());
 
         let width = 48;
         let height = pane.desired_height(width);
@@ -1385,7 +1483,7 @@ mod tests {
         });
 
         pane.set_task_running(true);
-        pane.set_queued_user_messages(vec!["Queued follow-up question".to_string()]);
+        pane.set_pending_input_preview(vec!["Queued follow-up question".to_string()], Vec::new());
         pane.hide_status_indicator();
 
         let width = 48;
@@ -1413,7 +1511,7 @@ mod tests {
         });
 
         pane.set_task_running(true);
-        pane.set_queued_user_messages(vec!["Queued follow-up question".to_string()]);
+        pane.set_pending_input_preview(vec!["Queued follow-up question".to_string()], Vec::new());
 
         let width = 48;
         let height = pane.desired_height(width);
@@ -1495,7 +1593,7 @@ mod tests {
                 interface: None,
                 dependencies: None,
                 policy: None,
-                permissions: None,
+                permission_profile: None,
                 path_to_skills_md: PathBuf::from("test-skill"),
                 scope: SkillScope::User,
             }]),
@@ -1557,6 +1655,90 @@ mod tests {
             );
         }
         assert_eq!(pane.composer_text(), "/");
+    }
+
+    #[test]
+    fn esc_with_agent_command_without_popup_does_not_interrupt_task() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(true);
+
+        // Repro: `/agent ` hides the popup (cursor past command name). Esc should
+        // keep editing command text instead of interrupting the running task.
+        pane.insert_str("/agent ");
+        assert!(
+            !pane.composer.popup_active(),
+            "expected command popup to be hidden after entering `/agent `"
+        );
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
+                "expected Esc to not send Op::Interrupt while typing `/agent`"
+            );
+        }
+        assert_eq!(pane.composer_text(), "/agent ");
+    }
+
+    #[test]
+    fn esc_release_after_dismissing_agent_picker_does_not_interrupt_task() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(true);
+        pane.show_selection_view(SelectionViewParams {
+            title: Some("Agents".to_string()),
+            items: vec![SelectionItem {
+                name: "Main".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        pane.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        pane.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
+                "expected Esc release after dismissing agent picker to not interrupt"
+            );
+        }
+        assert!(
+            pane.no_modal_or_popup_active(),
+            "expected Esc press to dismiss the agent picker"
+        );
     }
 
     #[test]
